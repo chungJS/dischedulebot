@@ -1,8 +1,11 @@
 import os
+import io
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+from PIL import Image, ImageDraw, ImageFont
 
 import sqlite3
 import logging
@@ -17,9 +20,9 @@ from zoneinfo import ZoneInfo
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GUILD_ID = 1540910310536388638
+GUILD_ID = os.getenv("GUILD_ID")
 
-DB_PATH = "schedule.db"
+DB_PATH = "/data/schedule.db"
 
 # 특정 날짜 일정은 오래된 데이터를 자동 정리합니다.
 SCHEDULE_RETENTION_DAYS = 10
@@ -113,6 +116,8 @@ def get_db():
 
     # 외래키 기능 활성화
     conn.execute("PRAGMA foreign_keys = ON")
+
+    conn.execute("PRAGMA journal_mode = WAL")
 
     return conn
 
@@ -256,32 +261,7 @@ bot = ScheduleBot()
 
 
 # ============================================================
-# 공통 메시지
-# ============================================================
-
-def send_error_message(
-    interaction: discord.Interaction,
-    message: str
-):
-    """
-    interaction 응답 여부에 따라
-    response 또는 followup으로 메시지를 보냅니다.
-    """
-    return (
-        interaction.followup.send(
-            message,
-            ephemeral=True
-        )
-        if interaction.response.is_done()
-        else interaction.response.send_message(
-            message,
-            ephemeral=True
-        )
-    )
-
-
-# ============================================================
-# 사용자 / 마스크
+# 사용자 / 권한
 # ============================================================
 
 def get_user_mask(user_id: int):
@@ -289,69 +269,270 @@ def get_user_mask(user_id: int):
     return USER_MASKS.get(user_id)
 
 
-def get_emoji(mask: int) -> str:
+async def ensure_authorized(interaction: discord.Interaction):
     """
-    일정 mask를 종합 색상으로 변환합니다.
-    """
+    등록된 사용자인지 확인합니다.
 
-    color_map = {
-        0: "⬜",
-        1: "🟥",
-        2: "🟦",
-        3: "🟪",
-        4: "🟨",
-        5: "🟧",
-        6: "🟩",
-        7: "⬛"
-    }
+    권한이 없으면 에러 메시지를 보내고 None을 반환하고,
+    있으면 해당 사용자의 mask를 반환합니다.
 
-    return color_map.get(mask, "⬜")
+    호출부에서는 다음과 같이 사용합니다:
 
-
-def get_users_from_mask(mask: int) -> str:
-    """
-    mask를 분석해서 불가능한 사용자 이름을 반환합니다.
-
-    규칙:
-    - 1명: 전체 이름
-    - 2명 이상: 각 이름의 첫 글자만 연결
-      예) 개리길이 + 소벌도리 → 개소
-          개리길이 + 주말을월일로 → 개주
-          소벌도리 + 주말을월일로 → 소주
-          3명 모두 → 개소주
+        user_mask = await ensure_authorized(interaction)
+        if user_mask is None:
+            return
     """
 
-    users = []
+    user_mask = get_user_mask(interaction.user.id)
 
-    for info in MASK_USER_INFO.values():
+    if user_mask is None:
+        await interaction.response.send_message(
+            "❌ 권한이 없습니다.",
+            ephemeral=True
+        )
+        return None
 
-        if mask & info["mask"]:
-            users.append(info["name"])
-
-    if not users:
-        return "전원 가능"
-
-    if len(users) == 1:
-        return users[0]
-
-    return "".join(user[0] for user in users)
+    return user_mask
 
 
-def get_individual_emojis(mask: int) -> str:
+async def ensure_valid_hours(
+    interaction: discord.Interaction,
+    start_hour: int,
+    end_hour: int
+) -> bool:
     """
-    상세 스케줄용 A/B/C 3칸을 반환합니다.
+    시간 범위가 올바른지 확인합니다.
+
+    올바르지 않으면 에러 메시지를 보내고 False를 반환합니다.
     """
 
-    result = []
+    if not validate_hours(start_hour, end_hour):
+        await interaction.response.send_message(
+            "❌ 시간 설정이 올바르지 않습니다.",
+            ephemeral=True
+        )
+        return False
 
-    for info in MASK_USER_INFO.values():
+    return True
 
-        if mask & info["mask"]:
-            result.append(info["emoji"])
-        else:
-            result.append("⬜")
 
-    return "".join(result)
+# ============================================================
+# 이미지 렌더링 (Pillow)
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_PATH = os.path.join(BASE_DIR, "NanumGothic-Regular.ttf")
+
+
+def _load_font(size: int):
+    """
+    schebot.py와 같은 폴더의 폰트 파일을 항상 정확히 찾습니다.
+    실행 위치(cwd)가 달라져도 영향받지 않습니다.
+    """
+
+    if os.path.exists(FONT_PATH):
+        try:
+            return ImageFont.truetype(FONT_PATH, size)
+        except OSError:
+            pass
+
+    # 혹시 폰트 파일에 문제가 생겨도 봇이 죽지 않도록 폴백
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+COLOR_HEX = {
+    0: (54, 57, 63),      # 전원가능 (배경과 어울리는 어두운 회색)
+    1: (237, 66, 69),     # 개 (빨강)
+    2: (88, 101, 242),    # 소 (파랑)
+    3: (170, 90, 200),    # 개+소
+    4: (250, 219, 60),    # 주 (노랑)
+    5: (240, 130, 60),    # 개+주
+    6: (90, 190, 140),    # 소+주
+    7: (30, 30, 34),      # 전원불가
+}
+
+WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def render_schedule_image(
+    dates: list[date],
+    specific_map,
+    recurring_map,
+    hour_range=range(24),
+) -> discord.File:
+    """
+    스케줄을 Pillow로 그려서 discord.File로 반환합니다.
+    클라이언트/폰트에 상관없이 항상 정렬이 보장됩니다.
+    """
+
+    cell_w, cell_h = 90, 40
+    label_w = 64
+    header_h = 84
+    padding = 20
+
+    n_cols = len(dates)
+    n_rows = len(list(hour_range))
+
+    width = padding * 2 + label_w + cell_w * n_cols
+    height = padding * 2 + header_h + cell_h * n_rows
+
+    img = Image.new("RGB", (width, height), (49, 51, 56))
+    draw = ImageDraw.Draw(img)
+
+    font_header = _load_font(22)
+    font_hour = _load_font(18)
+
+    for i, d in enumerate(dates):
+        x = padding + label_w + i * cell_w
+        date_text = f"{d.month:02d}/{d.day:02d}"
+        day_text = WEEKDAY_KR[d.weekday()]
+
+        draw.text(
+            (x + cell_w / 2, padding + 15),
+            date_text, fill="white", font=font_header, anchor="mm"
+        )
+        draw.text(
+            (x + cell_w / 2, padding + 38),
+            day_text, fill="white", font=font_header, anchor="mm"
+        )
+
+    # ---- 시간별 셀 ----
+    for row_idx, hour in enumerate(hour_range):
+        y = padding + header_h + row_idx * cell_h
+
+        if hour % 3 == 0:
+            draw.text(
+                (padding + label_w / 2, y + cell_h / 2),
+                f"{hour:02d}", fill="white", font=font_hour, anchor="mm"
+            )
+
+        for i, d in enumerate(dates):
+            mask = get_final_mask(d, hour, specific_map, recurring_map)
+            x = padding + label_w + i * cell_w
+
+            draw.rounded_rectangle(
+                [x + 4, y + 4, x + cell_w - 4, y + cell_h - 4],
+                radius=5,
+                fill=COLOR_HEX.get(mask, COLOR_HEX[0]),
+            )
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    return discord.File(buffer, filename="schedule.png")
+
+
+# ============================================================
+# 상세 스케줄 이미지 렌더링 (인원별 개별 칸)
+# ============================================================
+
+INDIVIDUAL_COLOR = {
+    1: (237, 66, 69),     # 개 (빨강)
+    2: (88, 101, 242),    # 소 (파랑)
+    4: (250, 219, 60),    # 주 (노랑)
+}
+
+FREE_COLOR = (60, 63, 68)  # 가능 (어두운 회색, 배경과 어울림)
+
+
+def render_detailed_schedule_image(
+    dates: list[date],
+    specific_map,
+    recurring_map,
+    hour_range=range(24),
+) -> discord.File:
+    """
+    상세 스케줄(인원별 개별 칸)을 하나의 이미지로 그려서
+    discord.File로 반환합니다. 하나의 메시지로 전송 가능합니다.
+    """
+
+    sub_w = 22          # 사용자 1명당 서브컬럼 너비
+    sub_gap = 3          # 서브컬럼 사이 간격
+    day_gap = 14          # 날짜 컬럼 사이 간격
+    cell_h = 26          # 시간당 셀 높이
+    label_w = 50          # 왼쪽 시간 라벨 너비
+    header_h = 70          # 상단 날짜/요일 영역 높이
+    padding = 20
+
+    n_users = len(MASK_USER_INFO)
+    day_col_w = sub_w * n_users + sub_gap * (n_users - 1)
+
+    n_cols = len(dates)
+    n_rows = len(list(hour_range))
+
+    width = (
+        padding * 2
+        + label_w
+        + day_col_w * n_cols
+        + day_gap * (n_cols - 1)
+    )
+    height = padding * 2 + header_h + cell_h * n_rows
+
+    img = Image.new("RGB", (width, height), (49, 51, 56))
+    draw = ImageDraw.Draw(img)
+
+    font_header = _load_font(20)
+    font_hour = _load_font(16)
+
+    # ---- 헤더: 날짜 + 요일 ----
+    day_x_positions = []
+
+    for i, d in enumerate(dates):
+        x = padding + label_w + i * (day_col_w + day_gap)
+        day_x_positions.append(x)
+
+        date_text = f"{d.month:02d}/{d.day:02d}"
+        day_text = WEEKDAY_KR[d.weekday()]
+
+        draw.text(
+            (x + day_col_w / 2, padding + 16),
+            date_text, fill="white", font=font_header, anchor="mm"
+        )
+        draw.text(
+            (x + day_col_w / 2, padding + 44),
+            day_text, fill="white", font=font_header, anchor="mm"
+        )
+
+    # ---- 시간별 셀 (인원별 서브컬럼) ----
+    user_masks_ordered = sorted(MASK_USER_INFO.keys())
+
+    for row_idx, hour in enumerate(hour_range):
+        y = padding + header_h + row_idx * cell_h
+
+        if hour % 3 == 0:
+            draw.text(
+                (padding + label_w / 2, y + cell_h / 2),
+                f"{hour:02d}", fill="white", font=font_hour, anchor="mm"
+            )
+
+        for i, d in enumerate(dates):
+            final_mask = get_final_mask(d, hour, specific_map, recurring_map)
+            base_x = day_x_positions[i]
+
+            for j, user_mask in enumerate(user_masks_ordered):
+                x = base_x + j * (sub_w + sub_gap)
+
+                is_busy = bool(final_mask & user_mask)
+                fill_color = (
+                    INDIVIDUAL_COLOR[user_mask]
+                    if is_busy
+                    else FREE_COLOR
+                )
+
+                draw.rounded_rectangle(
+                    [x + 2, y + 4, x + sub_w - 2, y + cell_h - 4],
+                    radius=5,
+                    fill=fill_color,
+                )
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    return discord.File(buffer, filename="detailed_schedule.png")
 
 
 # ============================================================
@@ -492,18 +673,8 @@ def get_day_names(day_ints: list[int]) -> str:
     }:
         return "주말"
 
-    names = [
-        "월",
-        "화",
-        "수",
-        "목",
-        "금",
-        "토",
-        "일"
-    ]
-
     return ", ".join(
-        names[i]
+        WEEKDAY_KR[i]
         for i in sorted(selected)
     )
 
@@ -625,24 +796,12 @@ async def add_busy(
     end_hour: app_commands.Range[int, 1, 24]
 ):
 
-    user_mask = get_user_mask(
-        interaction.user.id
-    )
-
+    user_mask = await ensure_authorized(interaction)
     if user_mask is None:
-        return await interaction.response.send_message(
-            "❌ 권한이 없습니다.",
-            ephemeral=True
-        )
+        return
 
-    if not validate_hours(
-        start_hour,
-        end_hour
-    ):
-        return await interaction.response.send_message(
-            "❌ 시간 설정이 올바르지 않습니다.",
-            ephemeral=True
-        )
+    if not await ensure_valid_hours(interaction, start_hour, end_hour):
+        return
 
     try:
         parsed_date = parse_user_date(date)
@@ -757,24 +916,12 @@ async def cancel_busy(
     end_hour: app_commands.Range[int, 1, 24]
 ):
 
-    user_mask = get_user_mask(
-        interaction.user.id
-    )
-
+    user_mask = await ensure_authorized(interaction)
     if user_mask is None:
-        return await interaction.response.send_message(
-            "❌ 권한이 없습니다.",
-            ephemeral=True
-        )
+        return
 
-    if not validate_hours(
-        start_hour,
-        end_hour
-    ):
-        return await interaction.response.send_message(
-            "❌ 시간 설정이 올바르지 않습니다.",
-            ephemeral=True
-        )
+    if not await ensure_valid_hours(interaction, start_hour, end_hour):
+        return
 
     try:
         parsed_date = parse_user_date(date)
@@ -942,15 +1089,9 @@ async def add_recurring(
     end_hour: app_commands.Range[int, 1, 24]
 ):
 
-    user_mask = get_user_mask(
-        interaction.user.id
-    )
-
+    user_mask = await ensure_authorized(interaction)
     if user_mask is None:
-        return await interaction.response.send_message(
-            "❌ 권한이 없습니다.",
-            ephemeral=True
-        )
+        return
 
     target_days = parse_days(days)
 
@@ -962,14 +1103,8 @@ async def add_recurring(
             ephemeral=True
         )
 
-    if not validate_hours(
-        start_hour,
-        end_hour
-    ):
-        return await interaction.response.send_message(
-            "❌ 시간 설정이 올바르지 않습니다.",
-            ephemeral=True
-        )
+    if not await ensure_valid_hours(interaction, start_hour, end_hour):
+        return
 
     try:
 
@@ -1057,15 +1192,9 @@ async def cancel_recurring(
     end_hour: app_commands.Range[int, 1, 24]
 ):
 
-    user_mask = get_user_mask(
-        interaction.user.id
-    )
-
+    user_mask = await ensure_authorized(interaction)
     if user_mask is None:
-        return await interaction.response.send_message(
-            "❌ 권한이 없습니다.",
-            ephemeral=True
-        )
+        return
 
     target_days = parse_days(days)
 
@@ -1075,14 +1204,8 @@ async def cancel_recurring(
             ephemeral=True
         )
 
-    if not validate_hours(
-        start_hour,
-        end_hour
-    ):
-        return await interaction.response.send_message(
-            "❌ 시간 설정이 올바르지 않습니다.",
-            ephemeral=True
-        )
+    if not await ensure_valid_hours(interaction, start_hour, end_hour):
+        return
 
     try:
 
@@ -1273,403 +1396,85 @@ async def cancel_recurring(
 # /스케줄
 # ============================================================
 
-@bot.tree.command(name="상세스케줄", description="오늘부터 5일간의 상세 스케줄 표를 확인합니다.")
+@bot.tree.command(name="상세스케줄", description="오늘부터 7일간의 상세 스케줄을 확인합니다.")
 async def show_detailed_schedule(
     interaction: discord.Interaction
 ):
 
     today = today_kst()
-
-    dates = [
-        today + timedelta(days=i)
-        for i in range(5)
-    ]
-
-    DATE_SPACES = [
-        3, 1, 1, 1, 0
-    ]
-
-    DAY_SPACES = [
-        5, 2, 2, 2, 2
-    ]
-
-    EMOJI_SPACES = [
-        1, 1, 1, 1, 1
-    ]
-
-    if len(DATE_SPACES) != 5:
-        raise ValueError(
-            "DATE_SPACES는 반드시 5개여야 합니다."
-        )
-
-    if len(DAY_SPACES) != 5:
-        raise ValueError(
-            "DAY_SPACES는 반드시 5개여야 합니다."
-        )
-
-    if len(EMOJI_SPACES) != 5:
-        raise ValueError(
-            "EMOJI_SPACES는 반드시 5개여야 합니다."
-        )
-
-    # ========================================================
-    # DB에서 전체 기간을 한 번에 가져오기
-    # ========================================================
-
-    with get_db() as conn:
-
-        specific_map = load_specific_schedule(
-            conn,
-            dates
-        )
-
-        recurring_map = load_recurring_schedule(
-            conn
-        )
-
-    # ========================================================
-    # 헤더
-    # ========================================================
-
-    day_names = [
-        "월",
-        "화",
-        "수",
-        "목",
-        "금",
-        "토",
-        "일"
-    ]
-
-    headers_list = []
-
-    for i, d in enumerate(dates):
-
-        date_text = (
-            f"{d.month:02d}/{d.day:02d}"
-        )
-
-        date_text = (
-            " " * DATE_SPACES[i]
-            + date_text
-        )
-
-        headers_list.append(
-            date_text
-        )
-
-    headers = "   ".join(
-        headers_list
-    )
-
-    weekdays_list = []
-
-    for i, d in enumerate(dates):
-
-        day_text = day_names[
-            d.weekday()
-        ]
-
-        day_text = (
-            " " * DAY_SPACES[i]
-            + day_text
-        )
-
-        weekdays_list.append(
-            day_text
-        )
-
-    weekdays = "     ".join(
-        weekdays_list
-    )
-
-    # ========================================================
-    # Embed 1
-    # ========================================================
-
-    embed1 = discord.Embed(
-        title="📅 Group's availability - Next 5 Days (자세히)",
-        color=0x2b2d31
-    )
-
-    grid1 = (
-        "```text\n"
-        + (" " * 2)
-        + headers
-        + "\n"
-        + (" " * 2)
-        + weekdays
-        + "\n"
-    )
-
-    # ========================================================
-    # Embed 2
-    # ========================================================
-
-    embed2 = discord.Embed(
-        color=0x2b2d31
-    )
-
-    grid2 = ""
-
-    # ========================================================
-    # 시간표
-    # ========================================================
-
-    for hour in range(24):
-
-        time_label = (
-            f"{hour:02d} "
-            if hour % 3 == 0
-            else "   "
-        )
-
-        row_emojis = []
-
-        for i, d in enumerate(dates):
-
-            final_mask = get_final_mask(
-                d,
-                hour,
-                specific_map,
-                recurring_map
-            )
-
-            day_emojis = (
-                (" " * EMOJI_SPACES[i])
-                + get_individual_emojis(
-                    final_mask
-                )
-            )
-
-            row_emojis.append(
-                day_emojis
-            )
-
-        row_str = (
-            f"{time_label}"
-            f"{' '.join(row_emojis)}\n"
-        )
-
-        if hour < 12:
-            grid1 += row_str
-        else:
-            grid2 += row_str
-
-    # ========================================================
-    # 코드블록
-    # ========================================================
-
-    grid1 += "```"
-
-    embed1.description = grid1
-
-    grid2 = (
-        "```text\n"
-        + grid2
-        + "```"
-    )
-
-    embed2.description = grid2
-
-    embed2.set_footer(
-        text=(
-                    "🟥:개리길이 불가 | "
-                    "🟦:소벌도리 불가 | "
-                    "🟨:주말을월일로 불가 | "
-                    "⬜:가능\n"
-                )
-    )
-
-    await interaction.response.send_message(
-        embed=embed1
-    )
-
-    await interaction.followup.send(
-        embed=embed2
-    )
-
-
-# ============================================================
-# /간단스케줄
-# ============================================================
-
-@bot.tree.command(name="스케줄", description="오늘부터 7일간의 스케줄 표를 확인합니다.")
-async def show_simple_schedule(
-    interaction: discord.Interaction
-):
-
-    today = today_kst()
-
     dates = [
         today + timedelta(days=i)
         for i in range(7)
     ]
-
-    day_names = [
-        "월",
-        "화",
-        "수",
-        "목",
-        "금",
-        "토",
-        "일"
-    ]
-
-    # ========================================================
-    # Embed
-    # ========================================================
-
-    embed = discord.Embed(
-        title=(
-            "📅 Group's availability - "
-            f"Week of {today.strftime('%b %d')} (간단히)"
-        ),
-        color=0x2b2d31
-    )
-
-    DATE_SPACES = [
-        0, 1, 1, 1, 1, 1, 1
-    ]
-
-    DAY_SPACES = [
-        2, 4, 4, 5, 4, 5, 4
-    ]
-
-    EMOJI_SPACES = [
-        2, 3, 4, 4, 4, 4, 3
-    ]
-
-    TIME_WIDTH = 2
-
-    if len(DATE_SPACES) != 7:
-        raise ValueError(
-            "DATE_SPACES는 반드시 7개여야 합니다."
-        )
-
-    if len(DAY_SPACES) != 7:
-        raise ValueError(
-            "DAY_SPACES는 반드시 7개여야 합니다."
-        )
-
-    if len(EMOJI_SPACES) != 7:
-        raise ValueError(
-            "EMOJI_SPACES는 반드시 7개여야 합니다."
-        )
-
-    # ========================================================
-    # DB에서 한 번만 조회
-    # ========================================================
+    end_date = dates[-1]
 
     with get_db() as conn:
+        specific_map = load_specific_schedule(conn, dates)
+        recurring_map = load_recurring_schedule(conn)
 
-        specific_map = load_specific_schedule(
-            conn,
-            dates
-        )
+    file = render_detailed_schedule_image(dates, specific_map, recurring_map)
 
-        recurring_map = load_recurring_schedule(
-            conn
-        )
+    title = (
+        f"📅 매니저 일정 - "
+        f"{today.month}월 {today.day}일~"
+        f"{end_date.month}월 {end_date.day}일 (자세히)"
+    )
 
-    # ========================================================
-    # 표
-    # ========================================================
-
-    grid = "```text\n"
-
-    # ========================================================
-    # 날짜
-    # ========================================================
-
-    grid += " " * TIME_WIDTH
-
-    for i, d in enumerate(dates):
-
-        date_text = (
-            f"{d.month:02d}/{d.day:02d}"
-        )
-
-        grid += (
-            " " * DATE_SPACES[i]
-        )
-
-        grid += date_text
-
-    grid += "\n"
-
-    # ========================================================
-    # 요일
-    # ========================================================
-
-    grid += " " * TIME_WIDTH
-
-    for i, d in enumerate(dates):
-
-        day_text = day_names[
-            d.weekday()
-        ]
-
-        grid += (
-            " " * DAY_SPACES[i]
-        )
-
-        grid += day_text
-
-    grid += "\n"
-
-    # ========================================================
-    # 시간별 일정
-    # ========================================================
-
-    for hour in range(24):
-
-        if hour % 3 == 0:
-            time_label = f"{hour:02d}"
-        else:
-            time_label = "  "
-
-        grid += time_label
-
-        for i, d in enumerate(dates):
-
-            final_mask = get_final_mask(
-                d,
-                hour,
-                specific_map,
-                recurring_map
-            )
-
-            emoji = get_emoji(
-                final_mask
-            )
-
-            grid += (
-                " " * EMOJI_SPACES[i]
-            )
-
-            grid += emoji
-
-        grid += "\n"
-
-    grid += "```"
-
-    embed.description = grid
-
+    embed = discord.Embed(
+        title=title,
+        color=0x2b2d31,
+    )
+    embed.set_image(url="attachment://detailed_schedule.png")
     embed.set_footer(
         text=(
-            "불가능한 인원) 🟥:개리길이 🟦:소벌도리 🟨:주말을월일로\n"
-            "🟪:개+소 🟧:개+주 🟩:소+주 ⬛:전원불가 ⬜:전원가능"
+            "🟥 빨강:개리길이 불가 | 🟦 파랑:소벌도리 불가\n"
+            "🟨 노랑:주말을월일로 불가 | ⬛ 빈칸:가능"
         )
     )
 
-    await interaction.response.send_message(
-        embed=embed
-    )
+    await interaction.response.send_message(embed=embed, file=file)
 
 
 # ============================================================
-# /조회
+# /스케줄
+# ============================================================
+
+@bot.tree.command(name="스케줄", description="오늘부터 7일간의 스케줄을 이미지로 확인합니다.")
+async def show_simple_schedule(interaction: discord.Interaction):
+
+    today = today_kst()
+    dates = [today + timedelta(days=i) for i in range(7)]
+    end_date = dates[-1]
+
+    with get_db() as conn:
+        specific_map = load_specific_schedule(conn, dates)
+        recurring_map = load_recurring_schedule(conn)
+
+    file = render_schedule_image(dates, specific_map, recurring_map)
+
+    title = (
+        f"📅 매니저 일정 - "
+        f"{today.month}월 {today.day}일~"
+        f"{end_date.month}월 {end_date.day}일"
+    )
+
+    embed = discord.Embed(
+        title=title,
+        color=0x2b2d31,
+    )
+    embed.set_image(url="attachment://schedule.png")
+    embed.set_footer(
+        text=(
+            "🟥 빨강:개리길이 | 🟦 파랑:소벌도리 | 🟨 노랑:주말을월일로\n"
+            "🟪 보라:개+소 | 🟧 주황:개+주 | 🟩 초록:소+주 | ⬛ 검정:전원불가"
+        )
+    )
+
+    await interaction.response.send_message(embed=embed, file=file)
+
+
+# ============================================================
+# /날짜조회
 # ============================================================
 
 @bot.tree.command(name="날짜조회", description="특정 날짜의 상세 불가 일정을 요약해서 보여줍니다.")
@@ -1811,17 +1616,7 @@ async def check_schedule(
     # Embed
     # ========================================================
 
-    day_names = [
-        "월",
-        "화",
-        "수",
-        "목",
-        "금",
-        "토",
-        "일"
-    ]
-
-    day_name = day_names[
+    day_name = WEEKDAY_KR[
         day_of_week
     ]
 
@@ -1878,8 +1673,7 @@ async def check_schedule(
 
         embed.set_footer(
             text=(
-                "표시된 시간을 제외한 "
-                "나머지 시간은 전원 가능합니다."
+                "표시된 시간을 제외한 나머지 시간은 전원 가능합니다."
             )
         )
 
@@ -1959,15 +1753,7 @@ async def show_recurring_schedule(
     # 요일 이름
     # --------------------------------------------------------
 
-    day_names = [
-        "월",
-        "화",
-        "수",
-        "목",
-        "금",
-        "토",
-        "일"
-    ]
+    day_names = WEEKDAY_KR
 
     # --------------------------------------------------------
     # 사람별 고정 일정 생성
@@ -2187,15 +1973,15 @@ async def show_commands(
     )
 
     embed.add_field(
-        name="📊 스케줄 확인",
+        name="📊 상세 스케줄",
         value=(
             "============================\n"
             "/상세스케줄\n"
-            "오늘부터 5일간의 상세 스케줄을 확인합니다.\n"
-            "각 날짜마다 인원들의 가능 여부 상세하게 표시됩니다.\n\n"
+            "오늘부터 7일간의 상세 스케줄을 이미지로 확인합니다.\n"
+            "각 날짜마다 인원별로 가능 여부가 개별 칸에 표시됩니다.\n\n"
 
             "/상스\n"
-            "위 `/스케줄`의 단축 명령어입니다.\n"
+            "위 `/상세스케줄`의 단축 명령어입니다.\n"
             "============================"
         ),
         inline=False
@@ -2206,8 +1992,8 @@ async def show_commands(
         value=(
             "============================\n"
             "/스케줄\n"
-            "오늘부터 7일간의 스케줄을 한눈에 확인합니다.\n"
-            "한 칸에 여러 사람의 불가 상태가 색상으로 표시됩니다.\n\n"
+            "오늘부터 7일간의 스케줄을 이미지로 한눈에 확인합니다.\n"
+            "한 칸에 여러 사람의 불가 상태가 하나의 색상으로 표시됩니다.\n\n"
 
             "/스\n"
             "위 `/스케줄`의 단축 명령어입니다.\n"
@@ -2261,14 +2047,13 @@ async def show_commands(
         name="🎨 색상 안내",
         value=(
             "============================\n"
-            "🟥 개리길이 불가\n"
-            "🟦 소벌도리 불가\n"
-            "🟨 주말을월일로 불가\n"
-            "🟪 개+소 불가\n"
-            "🟧 개+주 불가\n"
-            "🟩 소+주 불가\n"
-            "⬛ 개소주 불가\n"
-            "⬜ 개소주 가능\n"
+            "🟥 빨강 : 개리길이 불가\n"
+            "🟦 파랑 : 소벌도리 불가\n"
+            "🟨 노랑 : 주말을월일로 불가\n"
+            "🟪 보라 : 개+소 불가\n"
+            "🟧 주황 : 개+주 불가\n"
+            "🟩 초록 : 소+주 불가\n"
+            "⬛ 검정 : 개소주 불가\n"
             "============================"
         ),
         inline=False
