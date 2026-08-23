@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 
-DB_PATH = "schedule.db"
+DB_PATH = "/data/schedule.db"
 
 # 특정 날짜 일정은 오래된 데이터를 자동 정리합니다.
 SCHEDULE_RETENTION_DAYS = 10
